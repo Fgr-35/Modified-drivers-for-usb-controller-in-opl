@@ -1,0 +1,493 @@
+/*
+  Copyright 2009, Ifcaro, Volca
+  Licenced under Academic Free License version 3.0
+  Review OpenUsbLd README & LICENSE files for further details.
+*/
+
+#include "include/opl.h"
+#include "include/pad.h"
+#include "include/ioman.h"
+#include <libpad.h>
+#include <timer.h>
+#include <time.h>
+
+// Προσθήκη των απαραίτητων OPL headers για τις low-level κλήσεις στο μενού
+#include "include/util.h"
+
+#ifdef PADEMU
+#include <libds34bt.h>
+#include <libds34usb.h>
+#endif
+
+#define MAX_PADS 4
+
+// Cpu ticks per one milisecond
+#define CLOCKS_PER_MILISEC 147456
+
+// 200 ms per repeat
+#define DEFAULT_PAD_DELAY 200
+
+struct pad_data_t
+{
+    int port, slot;
+    int state;
+    u32 paddata;
+    u32 oldpaddata;
+    struct padButtonStatus buttons;
+
+    // pad_dma_buf is provided by the user, one buf for each pad
+    // contains the pad's current state
+    char padBuf[256] __attribute__((aligned(64)));
+
+    char actAlign[6];
+    int actuators;
+};
+
+/// current time in miliseconds (last update time)
+static u32 curtime = 0;
+static u32 time_since_last = 0;
+
+static unsigned short pad_count;
+static struct pad_data_t pad_data[MAX_PADS];
+
+// gathered pad data
+static u32 paddata;
+static u32 oldpaddata;
+
+static int delaycnt[16];
+static int paddelay[16];
+
+// KEY_ to PAD_ conversion table
+static const int keyToPad[17] = {
+    -1,
+    PAD_LEFT,
+    PAD_DOWN,
+    PAD_RIGHT,
+    PAD_UP,
+    PAD_START,
+    PAD_R3,
+    PAD_L3,
+    PAD_SELECT,
+    PAD_SQUARE,
+    PAD_CROSS,
+    PAD_CIRCLE,
+    PAD_TRIANGLE,
+    PAD_R1,
+    PAD_L1,
+    PAD_R2,
+    PAD_L2};
+
+/*
+ * waitPadReady()
+ */
+static int waitPadReady(struct pad_data_t *pad)
+{
+    int state;
+
+    // busy wait for the pad to get ready
+    do {
+        state = padGetState(pad->port, pad->slot);
+    } while ((state != PAD_STATE_STABLE) && (state != PAD_STATE_FINDCTP1) && (state != PAD_STATE_DISCONN));
+
+    return state;
+};
+
+static int initializePad(struct pad_data_t *pad)
+{
+    int tmp;
+    int modes;
+    int i;
+
+    LOG("PAD initializing pad %d,%d\n", pad->port, pad->slot);
+
+    // is there any device connected to that port?
+    if (waitPadReady(pad) == PAD_STATE_DISCONN) {
+        LOG("PAD pad %d,%d not connected.\n", pad->port, pad->slot);
+        return 1; // nope, don't waste your time here!
+    }
+
+    // How many different modes can this device operate in?
+    // i.e. get # entrys in the modetable
+    modes = padInfoMode(pad->port, pad->slot, PAD_MODETABLE, -1);
+    LOG("PAD The device has %d modes: ", modes);
+
+    if (modes > 0) {
+        LOG("( ");
+
+        for (i = 0; i < modes; i++) {
+            tmp = padInfoMode(pad->port, pad->slot, PAD_MODETABLE, i);
+            LOG("%d ", tmp);
+        }
+
+        LOG(")\n");
+    }
+
+    tmp = padInfoMode(pad->port, pad->slot, PAD_MODECURID, 0);
+    LOG("PAD It is currently using mode %d\n", tmp);
+
+    // If modes == 0, this is not a Dual shock controller
+    // (it has no actuator engines)
+    if (modes == 0) {
+        LOG("PAD This is a digital controller?\n");
+        return 1;
+    }
+
+    // Verify that the controller has a DUAL SHOCK mode
+    i = 0;
+    do {
+        if (padInfoMode(pad->port, pad->slot, PAD_MODETABLE, i) == PAD_TYPE_DUALSHOCK)
+            break;
+        i++;
+    } while (i < modes);
+
+    if (i >= modes) {
+        LOG("PAD This is no Dual Shock controller\n");
+        return 1;
+    }
+
+    // If ExId != 0x0 => This controller has actuator engines
+    // This check should always pass if the Dual Shock test above passed
+    tmp = padInfoMode(pad->port, pad->slot, PAD_MODECUREXID, 0);
+    if (tmp == 0) {
+        LOG("PAD This is no Dual Shock controller??\n");
+        return 1;
+    }
+
+    LOG("PAD Enabling dual shock functions\n");
+
+    // When using MMODE_LOCK, user cant change mode with Select button
+    padSetMainMode(pad->port, pad->slot, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK);
+
+    waitPadReady(pad);
+    tmp = padInfoPressMode(pad->port, pad->slot);
+    LOG("PAD infoPressMode: %d\n", tmp);
+
+    waitPadReady(pad);
+    tmp = padEnterPressMode(pad->port, pad->slot);
+    LOG("PAD enterPressMode: %d\n", tmp);
+
+    waitPadReady(pad);
+    pad->actuators = padInfoAct(pad->port, pad->slot, -1, 0);
+    LOG("PAD # of actuators: %d\n", pad->actuators);
+
+    if (pad->actuators != 0) {
+        pad->actAlign[0] = 0; // Enable small engine
+        pad->actAlign[1] = 1; // Enable big engine
+        pad->actAlign[2] = 0xff;
+        pad->actAlign[3] = 0xff;
+        pad->actAlign[4] = 0xff;
+        pad->actAlign[5] = 0xff;
+
+        waitPadReady(pad);
+        tmp = padSetActAlign(pad->port, pad->slot, pad->actAlign);
+        LOG("PAD padSetActAlign: %d\n", tmp);
+    } else {
+        LOG("PAD Did not find any actuators.\n");
+    }
+
+    waitPadReady(pad);
+
+    return 1;
+}
+
+static void updatePadState(struct pad_data_t *pad, int state)
+{ // To simplify processing, monitor only Disconnected, FindCTP1 & Stable states.
+    if ((state == PAD_STATE_DISCONN) || (state == PAD_STATE_STABLE) || (state == PAD_STATE_FINDCTP1))
+        pad->state = state;
+}
+
+static u32 readLeftJoy(struct pad_data_t *pad, u32 pdata)
+{
+    u32 padData = pdata;
+    int xDeadzone, yDeadzone;
+
+    if ((pad->buttons.mode >> 4) == 0x07) {
+        switch (gXSensitivity) {
+            case 0:
+                xDeadzone = 100;
+                break;
+            case 1:
+                xDeadzone = 80;
+                break;
+            case 2:
+                xDeadzone = 60;
+                break;
+            default:
+                xDeadzone = 80;
+        }
+
+        switch (gYSensitivity) {
+            case 0:
+                yDeadzone = 100;
+                break;
+            case 1:
+                yDeadzone = 80;
+                break;
+            case 2:
+                yDeadzone = 60;
+                break;
+            default:
+                yDeadzone = 80;
+        }
+
+        if (pad->buttons.ljoy_h < 127 - xDeadzone)
+            padData |= PAD_LEFT;
+        else if (pad->buttons.ljoy_h > 127 + xDeadzone)
+            padData |= PAD_RIGHT;
+
+        if (pad->buttons.ljoy_v < 127 - yDeadzone)
+            padData |= PAD_UP;
+        else if (pad->buttons.ljoy_v > 127 + yDeadzone)
+            padData |= PAD_DOWN;
+    }
+
+    return padData;
+}
+
+// Dynamic declarations για να επιτραπεί το compile του ShanWan στο μενού
+extern int ds34usb_get_status(int port);
+extern int ds34usb_get_data(int port, u8 *data);
+extern int ds34usb_set_rumble(int port, u8 lrum, u8 rrum);
+
+static int readPad(struct pad_data_t *pad)
+{
+    int rcode = 0, oldState, newState, ret, padsRead;
+    u32 newpdata = 0;
+
+    padsRead = 0;
+    oldState = pad->state;
+    newState = padGetState(pad->port, pad->slot);
+    updatePadState(pad, newState);
+    if ((oldState == PAD_STATE_DISCONN) && ((pad->state == PAD_STATE_STABLE) || (pad->state == PAD_STATE_FINDCTP1))) {
+        initializePad(pad);
+    }
+
+    int usb_connected = (ds34usb_get_status(0) > 0);
+
+        // 1. ΑΣΦΑΛΗΣ ΑΝΑΓΝΩΣΗ SHANWAN ΜΕ FRAME THROTTLE (ΔΙΟΡΘΩΣΗ ΓΙΑ ΤΑ ARTWORKS)
+    if (usb_connected) {
+        static u8 iop_rpc_buffer[64] __attribute__((aligned(16))); 
+        static int frame_throttle = 0;
+
+        // Αυξάνουμε τον μετρητή σε κάθε loop του GUI
+        frame_throttle++;
+
+        // Διαβάζουμε το χειριστήριο μόνο κάθε 2 frames (ελευθερώνει το 50% του USB Bus)
+        if (frame_throttle >= 2) {
+            frame_throttle = 0; // Reset τον μετρητή
+            
+            ret = ds34usb_get_data(0, iop_rpc_buffer);
+
+            if (ret > 0) {
+                u8 button_l = iop_rpc_buffer[2];
+                u8 button_h = iop_rpc_buffer[3];
+
+                u16 out_buttons = 0x0000;
+                out_buttons = ((button_h ^ 0xFF) << 8) | (button_l ^ 0xFF);
+
+                pad->buttons.btns = (button_h << 8) | button_l;
+                pad->paddata = out_buttons; // Αποθήκευση της νέας κατάστασης
+                newpdata = out_buttons;
+                padsRead++;
+                
+                pad->buttons.mode = 0x73; 
+                pad->buttons.ljoy_h = 127; 
+                pad->buttons.ljoy_v = 127; 
+                pad->buttons.rjoy_h = 127;
+                pad->buttons.rjoy_v = 127;
+            }
+        } else {
+            // Στα ενδιάμεσα frames που το USB bus διαβάζει τα εξώφυλλα, 
+            // κρατάμε απλώς τα κουμπιά που είχαν πατηθεί στο προηγούμενο frame
+            newpdata = pad->paddata;
+            if (newpdata != 0) padsRead++;
+        }
+    }
+
+
+    // 2. ΑΝΑΓΝΩΣΗ ΦΥΣΙΚΩΝ ΘΥΡΩΝ (ΜΟΝΟ ΑΝ ΔΕΝ ΥΠΑΡΧΕΙ USB)
+    if (!usb_connected) {
+        if ((pad->state == PAD_STATE_STABLE) || (pad->state == PAD_STATE_FINDCTP1)) {
+            ret = padRead(pad->port, pad->slot, &pad->buttons);
+            if (ret != 0) {
+                newpdata = 0xffff ^ pad->buttons.btns;
+                padsRead++;
+            }
+        }
+    }
+
+    if (padsRead > 0) {
+        if (newpdata != 0x0) rcode = 1;
+        newpdata |= readLeftJoy(pad, newpdata);
+        pad->oldpaddata = pad->paddata;
+        pad->paddata = newpdata;
+        paddata |= pad->paddata;
+    }
+
+    return rcode;
+}
+
+
+static int getKeyDelay(int id, int repeat)
+{
+    int delay = paddelay[id - 1];
+
+    if (!repeat)
+        delay *= 3;
+
+    return delay;
+}
+
+int readPads()
+{
+    int i;
+    oldpaddata = paddata;
+    paddata = 0;
+
+    u32 newtime = cpu_ticks() / CLOCKS_PER_MILISEC;
+    time_since_last = newtime - curtime;
+    curtime = newtime;
+
+    int rslt = 0;
+
+    for (i = 0; i < MAX_PADS; ++i) {
+        rslt |= readPad(&pad_data[i]);
+    }
+
+    for (i = 0; i < 16; ++i) {
+        if (getKeyPressed(i + 1))
+            delaycnt[i] -= time_since_last;
+        else
+            delaycnt[i] = getKeyDelay(i + 1, 0);
+    }
+
+    return rslt;
+}
+
+int getKey(int id)
+{
+    if ((id <= 0) || (id >= 17))
+        return 0;
+
+    int kid = id - 1;
+
+    if (getKeyOn(id)) {
+        delaycnt[kid] = getKeyDelay(id, 0);
+        KeyPressedOnce = 1;
+        DisableCron = 1;
+        return 1;
+    }
+    if (!getKeyPressed(id))
+        return 0;
+    if (delaycnt[kid] <= 0) {
+        delaycnt[kid] = getKeyDelay(id, 1);
+        KeyPressedOnce = 1;
+        DisableCron = 1;
+        return 1;
+    }
+    return 0;
+}
+
+int getKeyOn(int id)
+{
+    if ((id <= 0) || (id >= 17))
+return 0;
+int keyid = keyToPad[id];
+return (paddata & keyid) && (!(oldpaddata & keyid));
+}
+int getKeyOff(int id)
+{
+if ((id <= 0) || (id >= 17))
+return 0;
+int keyid = keyToPad[id];
+return (!(paddata & keyid)) && (oldpaddata & keyid);
+}
+int getKeyPressed(int id)
+{
+int keyid = keyToPad[id];
+return (paddata & keyid);
+}
+void setButtonDelay(int button, int btndelay)
+{
+if ((button <= 0) || (button >= 17))
+return;
+paddelay[button - 1] = btndelay;
+}
+int getButtonDelay(int button)
+{
+if ((button <= 0) || (button >= 17))
+return 0;
+return paddelay[button - 1];
+}
+static void unloadPad(struct pad_data_t *pad)
+{
+padPortClose(pad->port, pad->slot);
+}
+void unloadPads()
+{
+int i;
+for (i = 0; i < pad_count; ++i)
+unloadPad(&pad_data[i]);
+padEnd();
+}
+static int startPad(struct pad_data_t *pad)
+{
+int newState;
+if (padPortOpen(pad->port, pad->slot, pad->padBuf) == 0) {
+return 0;
+}
+if (!initializePad(pad)) {
+return 0;
+}
+newState = waitPadReady(pad);
+updatePadState(pad, newState);
+return 1;
+}
+int startPads()
+{
+pad_count = 0;
+int maxports = padGetPortMax();
+int port;
+int slot;
+int i;
+for (i = 0; i < MAX_PADS; i++) {
+pad_data[i].port = i;
+pad_data[i].slot = 0;
+pad_data[i].state = PAD_STATE_DISCONN;
+}
+for (port = 0; port < maxports; ++port) {
+int maxslots = padGetSlotMax(port);
+for (slot = 0; slot < maxslots; ++slot) {
+struct pad_data_t *cpad = &pad_data[pad_count];
+cpad->port = port;
+cpad->slot = slot;
+cpad->state = PAD_STATE_DISCONN;
+if (startPad(cpad))
+++pad_count;
+}
+if (pad_count >= MAX_PADS)
+break;
+}
+int n;
+for (n = 0; n < 16; ++n) {
+delaycnt[n] = DEFAULT_PAD_DELAY;
+paddelay[n] = DEFAULT_PAD_DELAY;
+}
+#ifdef PADEMU
+// Χρήση της επίσημης GUI init του OPL, αποφεύγοντας τα linker errors
+ds34usb_init();
+#endif
+return 1;
+}
+void padStoreSettings(int *buffer)
+{
+int i;
+for (i = 0; i < 16; i++)
+buffer[i] = paddelay[i];
+}
+void padRestoreSettings(int *buffer)
+{
+int i;
+for (i = 0; i < 16; i++)
+paddelay[i] = buffer[i];
+}
